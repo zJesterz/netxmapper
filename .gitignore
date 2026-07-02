@@ -1,0 +1,8 @@
+# Ignore CSV data files
+*.csv
+
+# Ignore ML model files
+*.pkl
+
+# Ignore virtual environment folder
+.venv/
