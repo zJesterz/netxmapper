@@ -6,7 +6,7 @@ import dash_cytoscape as cyto
 # Load CSV
 df = pd.read_csv("network_connections.csv")
 
-# Build Cytoscape elements
+# Build Cytoscape elements -
 elements = []
 edges = []   # store edges for sidebar logic
 
