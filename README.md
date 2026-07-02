@@ -1,5 +1,1 @@
-A simple network mapping system created using python 
--networkx and dash for visualization
--identify layer two devices using snmp and lldp protocols
--identify anomalies or downed devices in the network
--an alternative to expensive network mapping tools 
+A lightweight network topology discovery and anomaly detection system built with Python and Dash. Uses SNMP and LLDP to discover Layer-2 devices, maps inter-switch connections via Cytoscape.js visualization, applies Isolation Forest (scikit-learn) to detect performance anomalies from SNMP interface metrics, and reports downed devices via subnet scanning. Designed as an open-source alternative to expensive network mapping tools.
