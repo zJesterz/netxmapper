@@ -311,7 +311,8 @@ async def discover_switches(subnet):
     - silent_ips: hosts that are alive/pingable but don't respond to SNMP
       (e.g. your SNMP-disabled switch) — kept instead of discarded, since
       they may still show up as a neighbor in another switch's LLDP table."""
-    ip_list = [str(ip) for ip in ipaddress.IPv4Network(subnet)]
+    subnet_obj = ipaddress.IPv4Network(subnet)
+    ip_list = [str(ip) for ip in subnet_obj if ip != subnet_obj.network_address and ip != subnet_obj.broadcast_address]
     print(f"\nPinging {len(ip_list)} addresses in {subnet}...\n")
 
     snmp_ips = []

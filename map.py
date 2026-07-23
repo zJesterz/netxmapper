@@ -1,6 +1,10 @@
+import base64
+from io import BytesIO
+
 import pandas as pd
 import dash
-from dash import html, Input, Output
+from dash import html, Input, Output, dcc, exceptions, State, ctx
+from PIL import Image
 import dash_cytoscape as cyto
 
 # Load device statuses
@@ -41,19 +45,58 @@ for ip, status in status_map.items():
         "classes": cls
     })
 
-# Edges (store port info)
+# Edges (merge duplicate/bidirectional rows between the same pair of IPs
+# into a single edge, correctly attributing each port to the node it
+# actually belongs to)
+edge_groups = {}  # key: frozenset({ip1, ip2}) -> {"source", "target", "ports": {ip: port}}
+
 for _, row in df.iterrows():
     source = str(row["Local IP"]).strip()
     target = str(row["Neighbor IP"]).strip()
     lp = str(row["Local Port"]).strip()
-    np = str(row["Neighbor Port"]).strip()
+    npy = str(row["Neighbor Port"]).strip()
+
+    key = frozenset({source, target})
+
+    if key not in edge_groups:
+        edge_groups[key] = {
+            "source": source,   # canonical direction = first row seen for this pair
+            "target": target,
+            "ports": {}          # ip -> port belonging to that ip
+        }
+
+    group = edge_groups[key]
+
+    # "Neighbor Port" describes the neighbor's own port
+    if npy.lower() not in ("", "nan", "none"):
+        group["ports"][target] = npy
+    # "Local Port" describes the source's own port
+    if lp.lower() not in ("", "nan", "none"):
+        group["ports"][source] = lp
+
+for group in edge_groups.values():
+    source = group["source"]
+    target = group["target"]
+    ports = group["ports"]
+
+    source_port = ports.get(source)
+    target_port = ports.get(target)
+
+    if source_port and target_port:
+        label = f"{source_port}-{target_port}"
+    elif source_port:
+        label = source_port
+    elif target_port:
+        label = target_port
+    else:
+        label = "Unknown"
 
     edge_data = {
         "source": source,
         "target": target,
-        "label": f"{lp} ↔ {np}",
-        "local_port": lp,
-        "neighbor_port": np
+        "label": label,
+        "local_port": source_port or "",
+        "neighbor_port": target_port or ""
     }
 
     edges.append(edge_data)
@@ -62,6 +105,110 @@ for _, row in df.iterrows():
         "data": edge_data,
         "classes": "edge"
     })
+
+# Base stylesheet (shared)
+base_stylesheet = [
+
+    # ACTIVE NODE
+    {
+        "selector": ".active",
+        "style": {
+            "background-color": "#3A7BD5",
+            "label": "data(label)",
+            "font-size": "9px",
+            "color": "white",
+            "text-wrap": "wrap",
+            "text-max-width": "45px",
+            "text-valign": "center",
+            "text-halign": "center",
+            "width": "30px",
+            "height": "30px",
+            "shape": "ellipse",
+            "border-width": 1,
+            "border-color": "#d9e6ff",
+            "shadow-color": "#4da3ff",
+            "shadow-blur": 20,
+            "shadow-opacity": 0.6
+        }
+    },
+
+    # SNMP DISABLED NODE
+    {
+        "selector": ".snmp_disabled",
+        "style": {
+            "background-color": "#E67E22",
+            "label": "data(label)",
+            "font-size": "9px",
+            "color": "white",
+            "text-wrap": "wrap",
+            "text-max-width": "45px",
+            "text-valign": "center",
+            "text-halign": "center",
+            "width": "30px",
+            "height": "30px",
+            "shape": "ellipse",
+            "border-width": 2,
+            "border-color": "#f39c12",
+            "border-style": "dashed",
+            "shadow-color": "#e67e22",
+            "shadow-blur": 15,
+            "shadow-opacity": 0.4
+        }
+    },
+
+    # UNREACHABLE NODE
+    {
+        "selector": ".unreachable",
+        "style": {
+            "background-color": "#444",
+            "label": "data(label)",
+            "font-size": "9px",
+            "color": "#999",
+            "text-wrap": "wrap",
+            "text-max-width": "45px",
+            "text-valign": "center",
+            "text-halign": "center",
+            "width": "30px",
+            "height": "30px",
+            "shape": "ellipse",
+            "border-width": 2,
+            "border-color": "#e74c3c",
+            "shadow-color": "#e74c3c",
+            "shadow-blur": 10,
+            "shadow-opacity": 0.3
+        }
+    },
+
+    # MODERN EDGE STYLE (always visible, labels hidden until selection)
+    {
+        "selector": ".edge",
+        "style": {
+            "curve-style": "bezier",
+            "line-color": "#999",
+            "target-arrow-shape": "triangle",
+            "target-arrow-color": "#888",
+            "width": 1.8,
+            "font-size": "8px",
+            "color": "#e6e6e6",
+            "text-background-color": "#222",
+            "text-background-opacity": 0.7,
+            "text-background-padding": "2px",
+            "display": "element",
+            "label": ""
+        }
+    },
+
+    # SELECTED NODE
+    {
+        "selector": "node:selected",
+        "style": {
+            "border-width": 3,
+            "border-color": "#00e5ff",
+            "shadow-color": "#00e5ff",
+            "shadow-blur": 25,
+        }
+    }
+]
 
 # App
 app = dash.Dash(__name__)
@@ -86,6 +233,17 @@ app.layout = html.Div([
             "cursor": "pointer",
             "font-size": "14px",
             "font-weight": "600"
+        }),
+        html.Button("Download PDF", id="pdf-btn", style={
+            "padding": "8px 16px",
+            "background": "#2ecc71",
+            "color": "white",
+            "border-radius": "6px",
+            "border": "none",
+            "cursor": "pointer",
+            "font-size": "14px",
+            "font-weight": "600",
+            "margin-left": "8px"
         })
     ], style={
         "display": "flex",
@@ -113,107 +271,7 @@ app.layout = html.Div([
             zoomingEnabled=True,
             panningEnabled=True,
             autoungrabify=False,
-            stylesheet=[
-
-                # ACTIVE NODE
-                {
-                    "selector": ".active",
-                    "style": {
-                        "background-color": "#3A7BD5",
-                        "label": "data(label)",
-                        "font-size": "9px",
-                        "color": "white",
-                        "text-wrap": "wrap",
-                        "text-max-width": "45px",
-                        "text-valign": "center",
-                        "text-halign": "center",
-                        "width": "30px",
-                        "height": "30px",
-                        "shape": "ellipse",
-                        "border-width": 1,
-                        "border-color": "#d9e6ff",
-                        "shadow-color": "#4da3ff",
-                        "shadow-blur": 20,
-                        "shadow-opacity": 0.6
-                    }
-                },
-
-                # SNMP DISABLED NODE
-                {
-                    "selector": ".snmp_disabled",
-                    "style": {
-                        "background-color": "#E67E22",
-                        "label": "data(label)",
-                        "font-size": "9px",
-                        "color": "white",
-                        "text-wrap": "wrap",
-                        "text-max-width": "45px",
-                        "text-valign": "center",
-                        "text-halign": "center",
-                        "width": "30px",
-                        "height": "30px",
-                        "shape": "ellipse",
-                        "border-width": 2,
-                        "border-color": "#f39c12",
-                        "border-style": "dashed",
-                        "shadow-color": "#e67e22",
-                        "shadow-blur": 15,
-                        "shadow-opacity": 0.4
-                    }
-                },
-
-                # UNREACHABLE NODE
-                {
-                    "selector": ".unreachable",
-                    "style": {
-                        "background-color": "#444",
-                        "label": "data(label)",
-                        "font-size": "9px",
-                        "color": "#999",
-                        "text-wrap": "wrap",
-                        "text-max-width": "45px",
-                        "text-valign": "center",
-                        "text-halign": "center",
-                        "width": "30px",
-                        "height": "30px",
-                        "shape": "ellipse",
-                        "border-width": 2,
-                        "border-color": "#e74c3c",
-                        "shadow-color": "#e74c3c",
-                        "shadow-blur": 10,
-                        "shadow-opacity": 0.3
-                    }
-                },
-
-                # MODERN EDGE STYLE
-                {
-                    "selector": ".edge",
-                    "style": {
-                        "curve-style": "bezier",
-                        "line-color": "#999",
-                        "target-arrow-shape": "triangle",
-                        "target-arrow-color": "#888",
-                        "width": 1.8,
-                        "label": "data(label)",
-                        "font-size": "7px",
-                        "color": "#e6e6e6",
-                        "text-background-color": "#222",
-                        "text-background-opacity": 0.7,
-                        "text-background-padding": "2px"
-                    }
-                },
-
-                # SELECTED NODE
-                {
-                    "selector": "node:selected",
-                    "style": {
-                        "border-width": 3,
-                        "border-color": "#00e5ff",
-                        "shadow-color": "#00e5ff",
-                        "shadow-blur": 25,
-                    }
-                }
-            ]
+            stylesheet=base_stylesheet
         ),
 
         # SIDEBAR
@@ -225,94 +283,126 @@ app.layout = html.Div([
             "font-size": "14px",
             "border-left": "1px solid #222"
         })
-    ], style={"display": "flex"})
+    ], style={"display": "flex"}),
+
+    dcc.Download(id="download-pdf")
 ])
 
 
-# CALLBACK: show node details in sidebar
+# CALLBACK: show node OR edge details in sidebar
 @app.callback(
     Output("sidebar", "children"),
-    Input("network", "tapNodeData")
+    Input("network", "tapNodeData"),
+    Input("network", "tapEdgeData"),
 )
-def display_node_data(node):
-    if not node:
+def display_tap_data(node, edge):
+    triggered_prop = ctx.triggered[0]["prop_id"] if ctx.triggered else ""
+
+    # ---- EDGE CLICKED ----
+    if "tapEdgeData" in triggered_prop and edge:
+        source = edge.get("source", "")
+        target = edge.get("target", "")
+        local_port = edge.get("local_port", "")
+        neighbor_port = edge.get("neighbor_port", "")
+
+        source_name = sysname_map.get(source, "")
+        target_name = sysname_map.get(target, "")
+
         return html.Div([
-            html.H3("No Device Selected", style={"color": "#888"}),
-            html.P("Click a node to view details.")
+            html.H3("Link Information", style={"margin-bottom": "10px"}),
+            html.Hr(style={"border-color": "#333"}),
+            html.P(f"Source: {source}" + (f" ({source_name})" if source_name else "")),
+            html.P(f"Target: {target}" + (f" ({target_name})" if target_name else "")),
+            html.Br(),
+            html.P([
+                "Local Port: ",
+                html.Span(local_port, style={"color": "#00e5ff", "font-weight": "600"})
+            ]),
+            html.P([
+                "Neighbor Port: ",
+                html.Span(neighbor_port, style={"color": "#00e5ff", "font-weight": "600"})
+            ]),
         ])
 
-    node_ip = node["id"]
-    status = node.get("status", "unknown")
+    # ---- NODE CLICKED ----
+    if "tapNodeData" in triggered_prop and node:
+        node_ip = node["id"]
+        status = node.get("status", "unknown")
 
-    status_colors = {
-        "active": "#3A7BD5",
-        "snmp_disabled": "#E67E22",
-        "unreachable": "#e74c3c"
-    }
-    status_color = status_colors.get(status, "#888")
+        status_colors = {
+            "active": "#3A7BD5",
+            "snmp_disabled": "#E67E22",
+            "unreachable": "#e74c3c"
+        }
+        status_color = status_colors.get(status, "#888")
 
-    status_labels = {
-        "active": "Active (SNMP OK)",
-        "snmp_disabled": "SNMP Disabled",
-        "unreachable": "Unreachable"
-    }
-    status_label = status_labels.get(status, status)
+        status_labels = {
+            "active": "Active (SNMP OK)",
+            "snmp_disabled": "SNMP Disabled",
+            "unreachable": "Unreachable"
+        }
+        status_label = status_labels.get(status, status)
 
-    # Find all connected ports
-    connections = []
-    for e in edges:
-        if e["source"] == node_ip:
-            connections.append({
-                "neighbor": e["target"],
-                "local_port": e["local_port"],
-                "neighbor_port": e["neighbor_port"]
-            })
-        elif e["target"] == node_ip:
-            connections.append({
-                "neighbor": e["source"],
-                "local_port": e["neighbor_port"],
-                "neighbor_port": e["local_port"]
-            })
+        # Find all connected ports
+        connections = []
+        for e in edges:
+            if e["source"] == node_ip:
+                connections.append({
+                    "neighbor": e["target"],
+                    "local_port": e["local_port"],
+                    "neighbor_port": e["neighbor_port"]
+                })
+            elif e["target"] == node_ip:
+                connections.append({
+                    "neighbor": e["source"],
+                    "local_port": e["neighbor_port"],
+                    "neighbor_port": e["local_port"]
+                })
 
-    # Build display list
-    port_blocks = []
-    for c in connections:
-        port_blocks.append(
-            html.Div([
-                html.P(f"Connected to: {c['neighbor']}", style={"font-weight": "600"}),
-                html.P(f"Local Port: {c['local_port']}"),
-                html.P(f"Neighbor Port: {c['neighbor_port']}"),
-                html.Hr(style={"border-color": "#333"})
-            ])
-        )
+        port_blocks = []
+        for c in connections:
+            port_blocks.append(
+                html.Div([
+                    html.P(f"Connected to: {c['neighbor']}", style={"font-weight": "600"}),
+                    html.P(f"Local Port: {c['local_port']}"),
+                    html.P(f"Neighbor Port: {c['neighbor_port']}"),
+                    html.Hr(style={"border-color": "#333"})
+                ])
+            )
 
-    sysname = sysname_map.get(node_ip, "")
-    chassis = chassis_map.get(node_ip, "")
+        sysname = sysname_map.get(node_ip, "")
+        chassis = chassis_map.get(node_ip, "")
 
-    info_blocks = [
-        html.P(f"IP Address: {node_ip}"),
-        html.P([
-            "Status: ",
-            html.Span(status_label, style={"color": status_color, "font-weight": "600"})
-        ]),
-    ]
-    if sysname:
-        info_blocks.append(html.P(f"Name: {sysname}"))
-    if chassis:
-        info_blocks.append(html.P(f"Chassis ID: {chassis}"))
+        info_blocks = [
+            html.P(f"IP Address: {node_ip}"),
+            html.P([
+                "Status: ",
+                html.Span(status_label, style={"color": status_color, "font-weight": "600"})
+            ]),
+        ]
+        if sysname:
+            info_blocks.append(html.P(f"Name: {sysname}"))
+        if chassis:
+            info_blocks.append(html.P(f"Chassis ID: {chassis}"))
 
-    info_blocks.append(html.Br())
-    info_blocks.append(html.H4("LLDP Connections"))
+        info_blocks.append(html.Br())
+        info_blocks.append(html.H4("LLDP Connections"))
 
-    if port_blocks:
-        info_blocks.append(html.Div(port_blocks))
-    else:
-        info_blocks.append(html.P("No LLDP connections found.", style={"color": "#666"}))
+        if port_blocks:
+            info_blocks.append(html.Div(port_blocks))
+        else:
+            info_blocks.append(html.P("No LLDP connections found.", style={"color": "#666"}))
 
+        return html.Div([
+            html.H3("Device Information", style={"margin-bottom": "10px"}),
+            html.Hr(style={"border-color": "#333"}),
+            *info_blocks,
+        ])
+
+    # ---- NOTHING SELECTED ----
     return html.Div([
-        html.H3("Device Information", style={"margin-bottom": "10px"}),
-        html.Hr(style={"border-color": "#333"}),
-        *info_blocks,
+        html.H3("No Device Selected", style={"color": "#888"}),
+        html.P("Click a node or edge to view details.")
     ])
 
 
@@ -324,6 +414,101 @@ def display_node_data(node):
 )
 def fit_graph(n):
     return {"name": "preset", "fit": True}
+
+
+# CALLBACK: trigger Cytoscape image generation
+@app.callback(
+    Output("network", "generateImage"),
+    Input("pdf-btn", "n_clicks"),
+    prevent_initial_call=True
+)
+def generate_image(n_clicks):
+    if not n_clicks:
+        raise exceptions.PreventUpdate
+    return {
+        "type": "png",
+        "action": "store",
+        "options": {
+            "full": True,
+            "scale": 2,
+            "bg": "#0d0d0d"
+        }
+    }
+
+
+# CALLBACK: convert generated PNG to PDF and download
+@app.callback(
+    Output("download-pdf", "data"),
+    Input("network", "imageData"),
+    prevent_initial_call=True
+)
+def generate_pdf(png_data):
+    if not png_data:
+        raise exceptions.PreventUpdate
+
+    if "," in png_data:
+        png_data = png_data.split(",", 1)[1]
+
+    img_data = base64.b64decode(png_data)
+    img = Image.open(BytesIO(img_data))
+
+    # Calculate PDF page size from image dimensions at 300 DPI
+    # 1 inch = 72 points in PDF, so: width_points = width_pixels / dpi * 72
+    dpi = 300
+    width_px, height_px = img.size
+    page_width = width_px * 72 / dpi
+    page_height = height_px * 72 / dpi
+
+    pdf_buffer = BytesIO()
+    img.save(pdf_buffer, format="PDF", dpi=(dpi, dpi))
+    pdf_buffer.seek(0)
+    return dcc.send_bytes(pdf_buffer.read(), "topology_map.pdf")
+
+
+# CLIENTSIDE CALLBACK: highlight edges connected to the selected node
+# (all edges stay visible always; only the selected node's edges get
+# highlighted color + label)
+app.clientside_callback(
+    """
+    function(selectedNodeDataList, currentStylesheet) {
+        if (!currentStylesheet) return [];
+
+        // Drop any previously-added highlight rule so the array
+        // doesn't grow forever across clicks
+        var newStylesheet = currentStylesheet.filter(function(rule) {
+            return rule.selector.indexOf("edge[source") !== 0 &&
+                   rule.selector.indexOf("edge[target") !== 0;
+        });
+
+        // selectedNodeDataList is [] whenever nothing is selected —
+        // this covers clicking empty canvas, clicking an edge, or
+        // pressing Escape, since Cytoscape's default single-selection
+        // mode deselects the previous node in all of those cases.
+        if (!selectedNodeDataList || selectedNodeDataList.length === 0) {
+            return newStylesheet;
+        }
+
+        var selectedId = selectedNodeDataList[0].id;
+
+        newStylesheet.push({
+            "selector": "edge[source = '" + selectedId + "'], edge[target = '" + selectedId + "']",
+            "style": {
+                "line-color": "#00e5ff",
+                "target-arrow-color": "#00e5ff",
+                "width": 3,
+                "z-index": 999,
+                "label": "data(label)"
+            }
+        });
+
+        return newStylesheet;
+    }
+    """,
+    Output("network", "stylesheet"),
+    Input("network", "selectedNodeData"),
+    State("network", "stylesheet"),
+    prevent_initial_call=True
+)
 
 
 if __name__ == '__main__':
