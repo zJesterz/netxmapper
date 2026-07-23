@@ -1,133 +1,124 @@
-from pysnmp.hlapi.asyncio import *
-import asyncio
 import pandas as pd
 import os
 import hashlib
+import subprocess
 
-COMMUNITY = "christ"
-PORT = 161
 
-OIDS = {
-    "lldpRemChassisId": "1.0.8802.1.1.2.1.4.1.1.5",
-    "lldpRemPortId": "1.0.8802.1.1.2.1.4.1.1.7",
-    "lldpLocPortId": "1.0.8802.1.1.2.1.3.7.1.3",
+MANUAL_CHASSIS_MAP = {
+    "00:17:7c:6b:2d:2a": "192.168.1.22",
 }
 
 
-async def snmp_walk(target, oid):
-    results = {}
-    async for (errorIndication, errorStatus, errorIndex, varBinds) in walkCmd(
-        SnmpEngine(),
-        CommunityData(COMMUNITY, mpModel=1),
-        UdpTransportTarget((target, PORT), timeout=1, retries=1),
-        ContextData(),
-        ObjectType(ObjectIdentity(oid)),
-        lexicographicMode=False
-    ):
-        if errorIndication:
-            print(f"[{target}] SNMP Error: {errorIndication}")
-            break
-        elif errorStatus:
-            print(f"[{target}] SNMP Error: {errorStatus.prettyPrint()}")
-            break
-        else:
-            for varBind in varBinds:
-                results[str(varBind[0])] = varBind[1]
-    return results
-
-
-def oid_suffix(full_oid, column_oid):
-    f = tuple(map(int, full_oid.strip('.').split('.')))
-    c = tuple(map(int, column_oid.strip('.').split('.')))
-    return f[len(c):]
-
-
-def mac_bytes_to_str(octets):
+def get_local_ips():
+    ips = set()
     try:
-        b = bytes(octets) if isinstance(octets, (bytearray,)) else bytes(octets.asNumbers())
-        return ':'.join(f'{x:02x}' for x in b).lower()
+        result = subprocess.run(
+            ["ipconfig"], capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.splitlines():
+            if "IPv4" in line and ":" in line:
+                ip = line.split(":")[-1].strip()
+                if ip:
+                    ips.add(ip)
     except Exception:
-        return str(octets).lower()
+        pass
+    return ips
 
 
-def normalize_chassis(val):
-    if isinstance(val, (bytes, bytearray)):
-        return mac_bytes_to_str(val)
-    s = str(val).strip().lower().replace("-", ":")
-    parts = s.split(":")
-    if all(len(p) == 2 and all(c in "0123456789abcdef" for c in p) for p in parts) and len(parts) == 6:
-        return s
-    try:
-        ascii_chars = [chr(int(p, 16)) for p in parts if len(p) == 2]
-        ascii_str = "".join(ascii_chars)
-        return ascii_str.replace("-", ":").lower()
-    except ValueError:
-        return s
+def normalize_mac(mac):
+    return mac.strip().lower().replace("-", ":")
 
 
-async def main():
-    chassis_df = pd.read_csv("chassis_ids.csv")
-    chassis_df["Status"] = chassis_df["Status"].astype(str).str.strip().str.lower()
+def main():
+    local_ips = get_local_ips()
+    print(f"Local machine IPs detected: {local_ips}")
 
-    mac_to_ip = {}
-    for _, row in chassis_df.iterrows():
-        chassis = str(row["Chassis ID"]).strip().lower().replace("-", ":")
-        if chassis in ["", "nan", None]:
-            continue
-        mac_to_ip[chassis] = row["IP"]
+    summary = pd.read_csv("switch_summary.csv")
+    summary["Status"] = summary["Status"].astype(str).str.strip().str.lower()
+    summary = summary[~summary["IP"].isin(local_ips)]
+
+    chassis_to_ip = {}
+    sysname_to_ip = {}
+    for _, row in summary.iterrows():
+        ip = str(row["IP"]).strip()
+        chassis = str(row.get("Local Chassis ID", "")).strip()
+        if chassis.lower() not in ("", "nan", "none"):
+            chassis_to_ip[normalize_mac(chassis)] = ip
+        sysname = str(row.get("Local SysName", "")).strip()
+        if sysname.lower() not in ("", "nan", "none"):
+            sysname_to_ip[sysname.lower()] = ip
+
+    arp_mac_to_ip = {}
+    if os.path.exists("arp_mappings.csv") and os.path.getsize("arp_mappings.csv") > 5:
+        arp_df = pd.read_csv("arp_mappings.csv")
+        for _, row in arp_df.iterrows():
+            mac = normalize_mac(str(row["MAC"]).strip())
+            ip = str(row["IP"]).strip()
+            arp_mac_to_ip[mac] = ip
+        print(f"Loaded {len(arp_mac_to_ip)} ARP MAC -> IP mappings")
+
+    lldp = pd.read_csv("lldp_neighbors.csv")
 
     network_connections = []
-    active_devices = chassis_df[chassis_df["Status"] == "active"]
+    unresolved = {}
 
-    if active_devices.empty:
-        print("No active devices found in chassis_ids.csv. Exiting...")
-        return
+    for _, row in lldp.iterrows():
+        local_ip = str(row["Local IP"]).strip()
+        neighbor_chassis = str(row["Neighbor Chassis ID"]).strip()
+        neighbor_port = str(row.get("Neighbor Port", "")).strip()
+        neighbor_sysname = str(row.get("Neighbor SysName", "")).strip()
+        neighbor_mgmt = str(row.get("Neighbor Management IP", "")).strip()
+        nm = normalize_mac(neighbor_chassis)
 
-    print("\nActive devices to scan:")
-    print(active_devices["IP"].tolist())
+        resolved_ip = chassis_to_ip.get(nm)
+        if not resolved_ip:
+            resolved_ip = MANUAL_CHASSIS_MAP.get(nm)
+        if not resolved_ip and neighbor_mgmt.lower() not in ("", "nan", "none"):
+            resolved_ip = neighbor_mgmt
+        if not resolved_ip and neighbor_sysname.lower() not in ("", "nan", "none"):
+            resolved_ip = sysname_to_ip.get(neighbor_sysname.lower())
+        if not resolved_ip:
+            resolved_ip = arp_mac_to_ip.get(nm)
 
-    for local_ip in active_devices["IP"]:
-        print(f"Fetching LLDP info from {local_ip} ...")
+        if not resolved_ip:
+            resolved_ip = "unknown"
+            if nm not in unresolved:
+                unresolved[nm] = {
+                    "chassis": neighbor_chassis,
+                    "sysname": neighbor_sysname,
+                    "connected_from": [],
+                    "ports": [],
+                }
+            unresolved[nm]["connected_from"].append(local_ip)
+            unresolved[nm]["ports"].append(neighbor_port)
 
-        lldp_chassis = await snmp_walk(local_ip, OIDS["lldpRemChassisId"])
-        lldp_rport = await snmp_walk(local_ip, OIDS["lldpRemPortId"])
-        lldp_lportid = await snmp_walk(local_ip, OIDS["lldpLocPortId"])
+        network_connections.append([local_ip, "", resolved_ip, neighbor_port])
 
-        lldp = {}
-        for foid, val in lldp_chassis.items():
-            idx = oid_suffix(foid, OIDS["lldpRemChassisId"])
-            norm_mac = normalize_chassis(val)
-            lldp.setdefault(idx, {})["Neighbor Chassis"] = norm_mac
-
-        for foid, val in lldp_rport.items():
-            idx = oid_suffix(foid, OIDS["lldpRemPortId"])
-            lldp.setdefault(idx, {})["Neighbor Port"] = str(val)
-
-        local_ports = {oid_suffix(foid, OIDS["lldpLocPortId"]): str(val)
-                       for foid, val in lldp_lportid.items()}
-
-        for (timeMark, local_port, rem_idx), v in lldp.items():
-            lport = local_ports.get((local_port,), f"LocalPort{local_port}")
-            neighbor_mac = v.get("Neighbor Chassis", "unknown").replace("-", ":").lower()
-            neighbor_ip = mac_to_ip.get(neighbor_mac, "unknown")
-            neighbor_port = v.get("Neighbor Port", "unknown")
-            network_connections.append([local_ip, lport, neighbor_ip, neighbor_port])
+    if unresolved:
+        print("\n=== Unresolved Neighbor Chassis IDs ===")
+        print("Add these to MANUAL_CHASSIS_MAP in Topology.py:\n")
+        for mac, info in unresolved.items():
+            print(f'    "{mac}": "<IP_ADDRESS>",')
+            print(f"        # {info['chassis']} (sysName: {info['sysname'] or 'N/A'})")
+            print(f"        # Connected from: {', '.join(info['connected_from'])}")
+            print(f"        # Ports: {', '.join(info['ports'])}")
+        print()
 
     df_network = pd.DataFrame(
         network_connections,
         columns=["Local IP", "Local Port", "Neighbor IP", "Neighbor Port"]
-    ).astype(str).apply(lambda x: x.str.strip())
+    )
 
     df_network = df_network[df_network["Neighbor IP"].str.lower() != "unknown"]
 
-    df_network["pair_key"] = df_network.apply(
-        lambda r: "-".join(sorted([r["Local IP"], r["Neighbor IP"]])), axis=1)
-    df_network["port_key"] = df_network.apply(
-        lambda r: "-".join(sorted([r["Local Port"], r["Neighbor Port"]])), axis=1)
-
-    df_network = df_network.drop_duplicates(subset=["pair_key", "port_key"]).drop(
-        columns=["pair_key", "port_key"]
-    )
+    if not df_network.empty:
+        df_network["pair_key"] = df_network.apply(
+            lambda r: "-".join(sorted([r["Local IP"], r["Neighbor IP"]])), axis=1)
+        df_network["port_key"] = df_network.apply(
+            lambda r: "-".join(sorted([r["Local Port"], r["Neighbor Port"]])), axis=1)
+        df_network = df_network.drop_duplicates(subset=["pair_key", "port_key"]).drop(
+            columns=["pair_key", "port_key"]
+        )
 
     def hash_df(df):
         df_sorted = df.sort_index(axis=1).sort_values(by=list(df.columns))
@@ -148,9 +139,16 @@ async def main():
         df_network.to_csv(csv_file, index=False)
         print("CSV did not exist. Created new CSV.")
 
-    print("\n=== Final Network Connections ===")
-    print(df_network)
+    print("\n=== Network Connections ===")
+    if df_network.empty:
+        print("(no resolved connections)")
+    else:
+        print(df_network.to_string(index=False))
+
+    devices_df = summary[["IP", "Status", "Local Chassis ID", "Local SysName"]].copy()
+    devices_df.to_csv("devices.csv", index=False)
+    print("\nDevices exported to devices.csv")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

@@ -3,23 +3,42 @@ import dash
 from dash import html, Input, Output
 import dash_cytoscape as cyto
 
-# Load CSV
+# Load device statuses
+devices_df = pd.read_csv("devices.csv")
+status_map = {}
+sysname_map = {}
+chassis_map = {}
+for _, row in devices_df.iterrows():
+    ip = str(row["IP"]).strip()
+    status = str(row["Status"]).strip().lower()
+    # Normalize: treat alive_snmp_silent same as snmp_disabled for styling
+    if status == "alive_snmp_silent":
+        status = "snmp_disabled"
+    status_map[ip] = status
+    sysname = str(row.get("Local SysName", "")).strip()
+    if sysname.lower() not in ("", "nan", "none"):
+        sysname_map[ip] = sysname
+    chassis = str(row.get("Local Chassis ID", "")).strip()
+    if chassis.lower() not in ("", "nan", "none"):
+        chassis_map[ip] = chassis
+
+# Load network connections
 df = pd.read_csv("network_connections.csv")
 
-# Build Cytoscape elements -
+# Build Cytoscape elements
 elements = []
 edges = []   # store edges for sidebar logic
 
-# Nodes
-unique_ips = pd.concat([df["Local IP"], df["Neighbor IP"]]).unique()
-
-for ip in unique_ips:
+# Nodes — ALL devices from devices.csv, color-coded by status
+for ip, status in status_map.items():
+    cls = status if status in ("active", "snmp_disabled", "unreachable") else "active"
     elements.append({
         "data": {
             "id": ip,
-            "label": ip
+            "label": ip,
+            "status": status
         },
-        "classes": "node"
+        "classes": cls
     })
 
 # Edges (store port info)
@@ -96,9 +115,9 @@ app.layout = html.Div([
             autoungrabify=False,
             stylesheet=[
 
-                # MODERN NODE STYLE
+                # ACTIVE NODE
                 {
-                    "selector": ".node",
+                    "selector": ".active",
                     "style": {
                         "background-color": "#3A7BD5",
                         "label": "data(label)",
@@ -116,6 +135,53 @@ app.layout = html.Div([
                         "shadow-color": "#4da3ff",
                         "shadow-blur": 20,
                         "shadow-opacity": 0.6
+                    }
+                },
+
+                # SNMP DISABLED NODE
+                {
+                    "selector": ".snmp_disabled",
+                    "style": {
+                        "background-color": "#E67E22",
+                        "label": "data(label)",
+                        "font-size": "9px",
+                        "color": "white",
+                        "text-wrap": "wrap",
+                        "text-max-width": "45px",
+                        "text-valign": "center",
+                        "text-halign": "center",
+                        "width": "30px",
+                        "height": "30px",
+                        "shape": "ellipse",
+                        "border-width": 2,
+                        "border-color": "#f39c12",
+                        "border-style": "dashed",
+                        "shadow-color": "#e67e22",
+                        "shadow-blur": 15,
+                        "shadow-opacity": 0.4
+                    }
+                },
+
+                # UNREACHABLE NODE
+                {
+                    "selector": ".unreachable",
+                    "style": {
+                        "background-color": "#444",
+                        "label": "data(label)",
+                        "font-size": "9px",
+                        "color": "#999",
+                        "text-wrap": "wrap",
+                        "text-max-width": "45px",
+                        "text-valign": "center",
+                        "text-halign": "center",
+                        "width": "30px",
+                        "height": "30px",
+                        "shape": "ellipse",
+                        "border-width": 2,
+                        "border-color": "#e74c3c",
+                        "shadow-color": "#e74c3c",
+                        "shadow-blur": 10,
+                        "shadow-opacity": 0.3
                     }
                 },
 
@@ -176,6 +242,21 @@ def display_node_data(node):
         ])
 
     node_ip = node["id"]
+    status = node.get("status", "unknown")
+
+    status_colors = {
+        "active": "#3A7BD5",
+        "snmp_disabled": "#E67E22",
+        "unreachable": "#e74c3c"
+    }
+    status_color = status_colors.get(status, "#888")
+
+    status_labels = {
+        "active": "Active (SNMP OK)",
+        "snmp_disabled": "SNMP Disabled",
+        "unreachable": "Unreachable"
+    }
+    status_label = status_labels.get(status, status)
 
     # Find all connected ports
     connections = []
@@ -205,15 +286,33 @@ def display_node_data(node):
             ])
         )
 
+    sysname = sysname_map.get(node_ip, "")
+    chassis = chassis_map.get(node_ip, "")
+
+    info_blocks = [
+        html.P(f"IP Address: {node_ip}"),
+        html.P([
+            "Status: ",
+            html.Span(status_label, style={"color": status_color, "font-weight": "600"})
+        ]),
+    ]
+    if sysname:
+        info_blocks.append(html.P(f"Name: {sysname}"))
+    if chassis:
+        info_blocks.append(html.P(f"Chassis ID: {chassis}"))
+
+    info_blocks.append(html.Br())
+    info_blocks.append(html.H4("LLDP Connections"))
+
+    if port_blocks:
+        info_blocks.append(html.Div(port_blocks))
+    else:
+        info_blocks.append(html.P("No LLDP connections found.", style={"color": "#666"}))
+
     return html.Div([
         html.H3("Device Information", style={"margin-bottom": "10px"}),
         html.Hr(style={"border-color": "#333"}),
-        html.P(f"IP Address: {node_ip}"),
-        html.P("Type: Switch / Router (detected)"),
-
-        html.Br(),
-        html.H4("LLDP Connections"),
-        html.Div(port_blocks)
+        *info_blocks,
     ])
 
 
